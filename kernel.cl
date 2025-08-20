@@ -65,3 +65,55 @@ __kernel void gemv_q8_base(__global const BlockQ8_0 *A,
     else
         *p = (half)(alpha * sum);
 }
+
+// 使用 image2D 存储权重的 SoA 版：A 的 int8 权重放入 RGBA 像素（每像素4个有符号int8）
+__kernel void gemv_q8_soa_img(read_only image2d_t AqImg,
+                              __global const half *Ad,
+                              __global const char *qB,
+                              __global const half *sB,
+                              __global half *C,
+                              int M, int K, float alpha, float beta)
+{
+    int row = get_global_id(0);
+    if (row >= M) return;
+
+    int blocks = K >> 5;   // K/32
+    int baseX  = 0;        // 每个块占 8 个像素（8*4 = 32）
+    __local char l_qB[32];
+    float sum = 0.0f;
+
+    for (int bi = 0; bi < blocks; ++bi)
+    {
+        int lid = get_local_id(0);
+        if (lid < 32)
+            l_qB[lid] = qB[bi * 32 + lid];
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        int x0 = baseX + bi * 8;
+        int acci = 0;
+        #pragma unroll
+        for (int t = 0; t < 8; ++t)
+        {
+            int2 coord = (int2)(x0 + t, row);
+            int4 px = read_imagei(AqImg, coord);
+            char qb0 = l_qB[4 * t + 0];
+            char qb1 = l_qB[4 * t + 1];
+            char qb2 = l_qB[4 * t + 2];
+            char qb3 = l_qB[4 * t + 3];
+            acci += px.x * (int)qb0;
+            acci += px.y * (int)qb1;
+            acci += px.z * (int)qb2;
+            acci += px.w * (int)qb3;
+        }
+
+        float d  = (float)Ad[row * blocks + bi];
+        float sb = (float)sB[bi];
+        sum += (float)acci * d * sb;
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    half oldv = C[row];
+    C[row] = (beta != 0.0f) ? (half)(beta * (float)oldv + alpha * sum)
+                            : (half)(alpha * sum);
+}
