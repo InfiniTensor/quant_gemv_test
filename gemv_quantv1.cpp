@@ -7,7 +7,7 @@
     4. 优化内存访问，权重拆分
     5. 使用image图像内存存储权重；
     6. ...
-*/ 
+*/
 /*
     量化作业示例-权重A：BlockQ8_0，激活值B：half
     内核测试：
@@ -26,6 +26,8 @@
 #include <random>
 #include <CL/cl.h>
 #include "half.hpp"
+#include <fstream>
+#include <sstream>
 
 using namespace std;
 using half_float::half;
@@ -135,6 +137,28 @@ inline int8_t clamp_int8(int v)
 {
     return static_cast<int8_t>(std::max(-128, std::min(127, v)));
 }
+
+// 激活 B 的对称 per-32 量化：输出 qB(int8) 与 sB(half per-block)
+void quantB_q8_per32(const vector<half> &B, vector<int8_t> &qB, vector<half> &sB, int k)
+{
+    int blocks = k / Block_size;
+    qB.resize(k);
+    sB.resize(blocks);
+    for (int j = 0, jj = 0; j < k; j += Block_size, ++jj)
+    {
+        float max_abs = 0.f;
+        for (int l = j; l < j + Block_size; ++l)
+            max_abs = max(max_abs, fabsf((float)B[l]));
+        half sd = (half)((max_abs > 0.f) ? (max_abs / QMAX) : EPS);
+        sB[jj] = sd;
+        for (int l = j; l < j + Block_size; ++l)
+        {
+            float v = (float)B[l] / (float)sd;
+            int iv = (int)roundf(v);
+            qB[l] = clamp_int8(iv);
+        }
+    }
+}
 // 量化最后一维 量化块存储
 // M: m x k ; produce BlockQ8_0: m x (k / 32)
 void quantv1(const vector<half> &M, vector<BlockQ8_0> &q_M, int m, int k, int blocks)
@@ -192,42 +216,20 @@ void quantv2(const vector<half> &M, vector<char> &q_M, vector<half> &q_d_M, int 
     }
 }
 
-// kernel 示例
-const char *kernelSource = R"CLC(
-    #define CL_TARGET_OPENCL_VERSION 200
-    #pragma OPENCL EXTENSION cl_khr_fp16 : enable
-    typedef struct {
-        half d;
-        char qs[32];
-    } BlockQ8_0;
-    __kernel void gemv_q8_base(__global const BlockQ8_0 *A, __global const half *B, __global half *C,
-                                int as, int ars, int acs, int bs, int brs, int bcs,
-                                int cs, int crs, int ccs,
-                                int M, int N, int K, float alpha, float beta) {
-        
-        int row_id = get_global_id(0);
-        BlockQ8_0 valueA;
-        half valueB = 0.0h;
-        half sum = 0.0h;
-
-        for (int i = 0; i < K / 32; i++) {
-            valueA =  *(A + row_id * ars + i * acs);
-            half value = 0.0h;
-            for (int j = 0; j < 32; j++) {
-                valueB = *(B + (i * 32 + j) * brs);
-                value += (half)(int)valueA.qs[j] * valueB;
-            }
-            sum += value * valueA.d;
-        }
-
-        __global half *p = C + row_id * crs;
-        if (beta != 0)
-            *p = (half)(beta * (*p) + alpha * (float)sum);
-        else
-            *p = (half)(alpha * (float)sum);
+static std::string loadTextFile(const std::string &path)
+{
+    std::ifstream ifs(path, std::ios::in | std::ios::binary);
+    if (!ifs)
+    {
+        throw std::runtime_error("Failed to open file: " + path);
     }
+    std::ostringstream oss;
+    oss << ifs.rdbuf();
+    return oss.str();
+}
 
-)CLC";
+const char *kernelPath = "./kernel.cl";
+// kernel 示例
 
 // ---------- Host 辅助：编译、运行、衡量函数 ----------
 void printDeviceInfo(cl_device_id device)
@@ -251,19 +253,23 @@ void printDeviceInfo(cl_device_id device)
 }
 
 double KernelTest(const string &kernelName,
-                  const char *kernelSrc,
+                  //   const char *kernelSrc,
                   cl_context context,
                   cl_device_id device,
                   cl_command_queue queue,
                   const vector<BlockQ8_0> &BlockA, // m x (k / 32)
-                  const vector<half> &B,           // n * k
+                  const vector<int8_t> &qB,        // n * k (int8)
+                  const vector<half> &sB,          // k/32 per-block scale for B (n==1)
                   vector<half> &C_gpu,
                   const vector<half> &C_ref,
                   int m, int n, int k,
                   float alpha, float beta)
 {
+    auto src = loadTextFile(kernelPath);
+    const char *kernelSource = src.c_str();
+    const size_t src_len = src.size();
     cl_int err;
-    cl_program program = clCreateProgramWithSource(context, 1, &kernelSrc, NULL, &err);
+    cl_program program = clCreateProgramWithSource(context, 1, &kernelSource, &src_len, &err);
     checkErr(err, "clCreateProgramWithSource");
     const char *buildOptions = "-cl-std=CL2.0";
     err = clBuildProgram(program, 1, &device, buildOptions, NULL, NULL);
@@ -283,25 +289,30 @@ double KernelTest(const string &kernelName,
 
     int blocks = k / Block_size;
     size_t sizeBlockA = (size_t)(m * blocks) * sizeof(BlockQ8_0);
-    size_t sizeB = (size_t)n * (size_t)k * sizeof(half);
+    size_t sizeQB = (size_t)n * (size_t)k * sizeof(int8_t);
+    size_t sizeSB = (size_t)(k / Block_size) * sizeof(half);
     size_t sizeC = (size_t)n * (size_t)m * sizeof(half);
 
     cl_mem bufA = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeBlockA, (void *)BlockA.data(), &err);
     checkErr(err, "clCreateBuffer A");
-    cl_mem bufB = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeB, (void *)B.data(), &err);
-    checkErr(err, "clCreateBuffer B");
+    cl_mem bufQB = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeQB, (void *)qB.data(), &err);
+    checkErr(err, "clCreateBuffer qB");
+    cl_mem bufSB = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeSB, (void *)sB.data(), &err);
+    checkErr(err, "clCreateBuffer sB");
     cl_mem bufC = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeC, (void *)C_gpu.data(), &err);
     checkErr(err, "clCreateBuffer C");
 
     // set kernel args
     int argIdx = 0;
     clSetKernelArg(kernel, argIdx++, sizeof(cl_mem), &bufA);
-    clSetKernelArg(kernel, argIdx++, sizeof(cl_mem), &bufB);
+    clSetKernelArg(kernel, argIdx++, sizeof(cl_mem), &bufQB);
+    clSetKernelArg(kernel, argIdx++, sizeof(cl_mem), &bufSB);
     clSetKernelArg(kernel, argIdx++, sizeof(cl_mem), &bufC);
     // strides
     // A:m*k B:n*k C:n*m
     // A * B^T = C^T
     int as = m * k / Block_size, ars = k / Block_size, acs = 1;
+    // qB layout matches B: n*k contiguous; for n==1, row-stride 1, col-stride k
     int bs = n * k, brs = 1, bcs = k;
     int cs = n * m, crs = 1, ccs = n;
     clSetKernelArg(kernel, argIdx++, sizeof(int), &as);
@@ -319,9 +330,24 @@ double KernelTest(const string &kernelName,
     clSetKernelArg(kernel, argIdx++, sizeof(float), &alpha);
     clSetKernelArg(kernel, argIdx++, sizeof(float), &beta);
 
-    // NDRange: 1D: (m)
-    size_t gws[1] = {(size_t)m};
-    size_t lws[1] = {256}; // 可以动态调整
+    // NDRange: 1D: (m) — 选择安全的 LWS，并将 GWS 向上取整到 LWS 的倍数
+    size_t devMaxWG = 0;
+    clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(devMaxWG), &devMaxWG, NULL);
+    size_t devMaxItems[3] = {0, 0, 0};
+    clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_ITEM_SIZES, sizeof(devMaxItems), &devMaxItems, NULL);
+    size_t kernelMaxWG = 0;
+    clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(kernelMaxWG), &kernelMaxWG, NULL);
+
+    size_t lwsCandidate = 256; // 目标 LWS
+    size_t lws0 = lwsCandidate;
+    lws0 = std::min(lws0, devMaxWG);
+    lws0 = std::min(lws0, devMaxItems[0]);
+    lws0 = std::min(lws0, kernelMaxWG);
+    if (lws0 == 0)
+        lws0 = 1; // 兜底
+
+    size_t lws[1] = {lws0};
+    size_t gws[1] = {((size_t)m + lws[0] - 1) / lws[0] * lws[0]};
 
     // warmup
     for (int i = 0; i < NUM_WARMUP; ++i)
@@ -357,16 +383,122 @@ double KernelTest(const string &kernelName,
 
     half max_abs = computeAbsoluteError(C_ref, C_gpu);
 
-    printf("Kernel: %s | avg_time = %.3f ms | max_abs_err = %f",
+    printf("Kernel: %s | avg_time = %.3f ms | max_abs_err = %f\n",
            kernelName.c_str(), avg_ms, (float)max_abs);
 
     // cleanup
     clReleaseMemObject(bufA);
-    clReleaseMemObject(bufB);
+    clReleaseMemObject(bufQB);
+    clReleaseMemObject(bufSB);
     clReleaseMemObject(bufC);
     clReleaseKernel(kernel);
     clReleaseProgram(program);
 
+    return avg_ms;
+}
+
+// 将 Aq(int8, M*K) 打包成 RGBA 像素，宽=K/4，高=M
+static void packAqToRGBA(const vector<char>& Aq, int m, int k, vector<int8_t>& rgba)
+{
+    rgba.resize((size_t)m * (size_t)(k/4) * 4);
+    size_t idx = 0;
+    for (int r = 0; r < m; ++r)
+    {
+        const char* row = Aq.data() + (size_t)r * (size_t)k;
+        for (int x = 0; x < k; x += 4)
+        {
+            rgba[idx++] = row[x+0];
+            rgba[idx++] = row[x+1];
+            rgba[idx++] = row[x+2];
+            rgba[idx++] = row[x+3];
+        }
+    }
+}
+
+double KernelTestImage(const string &kernelName,
+                       cl_context context,
+                       cl_device_id device,
+                       cl_command_queue queue,
+                       const vector<char>& Aq,
+                       const vector<half>& Ad,
+                       const vector<int8_t>& qB,
+                       const vector<half>& sB,
+                       vector<half>& C_gpu,
+                       const vector<half>& C_ref,
+                       int m, int k, float alpha, float beta)
+{
+    auto src = loadTextFile(kernelPath);
+    const char *kernelSource = src.c_str();
+    const size_t src_len = src.size();
+    cl_int err;
+    cl_program program = clCreateProgramWithSource(context, 1, &kernelSource, &src_len, &err);
+    checkErr(err, "clCreateProgramWithSource");
+    const char *buildOptions = "-cl-std=CL2.0";
+    err = clBuildProgram(program, 1, &device, buildOptions, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        size_t log_size = 0; clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+        string log(log_size, '\0'); clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, &log[0], NULL);
+        cerr << "Build failed:\n" << log << endl; exit(1);
+    }
+    cl_kernel kernel = clCreateKernel(program, kernelName.c_str(), &err);
+    checkErr(err, "clCreateKernel img");
+
+    // 创建 image2D  — 使用 CL_R/CL_RGBA 与 INT 格式
+    int width = k / 4, height = m;
+    vector<int8_t> rgba; packAqToRGBA(Aq, m, k, rgba);
+    cl_image_format fmt; fmt.image_channel_order = CL_RGBA; fmt.image_channel_data_type = CL_SIGNED_INT8;
+    cl_image_desc desc = {};
+    desc.image_type = CL_MEM_OBJECT_IMAGE2D;
+    desc.image_width = width;
+    desc.image_height = height;
+    desc.image_row_pitch = 0; // let runtime choose
+    cl_mem imgA = clCreateImage(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, &fmt, &desc, (void*)rgba.data(), &err);
+    checkErr(err, "clCreateImage A");
+
+    size_t sizeAd = (size_t)m * (size_t)(k/Block_size) * sizeof(half);
+    size_t sizeQB = (size_t)k * sizeof(int8_t);
+    size_t sizeSB = (size_t)(k/Block_size) * sizeof(half);
+    size_t sizeC  = (size_t)m * sizeof(half);
+    cl_mem bufAd = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeAd, (void*)Ad.data(), &err);
+    checkErr(err, "clCreateBuffer Ad");
+    cl_mem bufQB = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeQB, (void*)qB.data(), &err);
+    checkErr(err, "clCreateBuffer qB");
+    cl_mem bufSB = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeSB, (void*)sB.data(), &err);
+    checkErr(err, "clCreateBuffer sB");
+    cl_mem bufC  = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeC, (void*)C_gpu.data(), &err);
+    checkErr(err, "clCreateBuffer C");
+
+    int arg = 0;
+    clSetKernelArg(kernel, arg++, sizeof(cl_mem), &imgA);
+    clSetKernelArg(kernel, arg++, sizeof(cl_mem), &bufAd);
+    clSetKernelArg(kernel, arg++, sizeof(cl_mem), &bufQB);
+    clSetKernelArg(kernel, arg++, sizeof(cl_mem), &bufSB);
+    clSetKernelArg(kernel, arg++, sizeof(cl_mem), &bufC);
+    clSetKernelArg(kernel, arg++, sizeof(int), &m);
+    clSetKernelArg(kernel, arg++, sizeof(int), &k);
+    clSetKernelArg(kernel, arg++, sizeof(float), &alpha);
+    clSetKernelArg(kernel, arg++, sizeof(float), &beta);
+
+    size_t devMaxWG = 0, kernelMaxWG = 0; size_t devMaxItems[3] = {0,0,0};
+    clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(devMaxWG), &devMaxWG, NULL);
+    clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_ITEM_SIZES, sizeof(devMaxItems), &devMaxItems, NULL);
+    clGetKernelWorkGroupInfo(kernel, device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(kernelMaxWG), &kernelMaxWG, NULL);
+    size_t lws0 = std::min({(size_t)256, devMaxWG, devMaxItems[0], kernelMaxWG}); if (lws0==0) lws0=1;
+    size_t lws[1] = {lws0}; size_t gws[1] = {((size_t)m + lws[0]-1)/lws[0]*lws[0]};
+
+    for (int i=0;i<NUM_WARMUP;++i){ err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, gws, lws, 0, NULL, NULL); checkErr(err, "enqueue warmup img"); clFinish(queue);}    
+    vector<cl_event> evs(NUM_ITER);
+    for (int i=0;i<NUM_ITER;++i){ err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, gws, lws, 0, NULL, &evs[i]); checkErr(err, "enqueue img"); }
+    clWaitForEvents(NUM_ITER, evs.data());
+    double total_ms=0; for (int i=0;i<NUM_ITER;++i){ cl_ulong t0,t1; clGetEventProfilingInfo(evs[i], CL_PROFILING_COMMAND_START, sizeof(t0), &t0, NULL); clGetEventProfilingInfo(evs[i], CL_PROFILING_COMMAND_END, sizeof(t1), &t1, NULL); total_ms += (double)(t1-t0)/1e6; clReleaseEvent(evs[i]); }
+    double avg_ms = total_ms/NUM_ITER;
+
+    clEnqueueReadBuffer(queue, bufC, CL_TRUE, 0, sizeC, C_gpu.data(), 0, NULL, NULL);
+    half max_abs = computeAbsoluteError(C_ref, C_gpu);
+    printf("Kernel: %s | avg_time = %.3f ms | max_abs_err = %f", kernelName.c_str(), avg_ms, (float)max_abs);
+
+    clReleaseMemObject(imgA); clReleaseMemObject(bufAd); clReleaseMemObject(bufQB); clReleaseMemObject(bufSB); clReleaseMemObject(bufC);
+    clReleaseKernel(kernel); clReleaseProgram(program);
     return avg_ms;
 }
 
@@ -375,7 +507,7 @@ int main()
     // A:m*k B:n*k C:n*m
     // A * B^T = C^T
     int m = 122753;
-    int n = 1;    // gemv, n值固定为1
+    int n = 1; // gemv, n值固定为1
     int k = 2304;
     float alpha = 0.5f;
     float beta = 0.0f;
@@ -397,10 +529,18 @@ int main()
     vector<half> C_gpu(n * m);
     vector<half> C_ref(n * m);
 
-    // 量化 A -> qchars + scales
+    // 量化 A -> qchars + scales（v1:AoS）
     int blocks = k / Block_size;
     vector<BlockQ8_0> BlockA(m * blocks);
     quantv1(A, BlockA, m, k, blocks);
+    // 量化 A -> SoA（v2）
+    vector<char> Aq; vector<half> Ad;
+    quantv2(A, Aq, Ad, m, k);
+
+    // 量化激活 B -> qB(int8) + sB(half per-32)
+    vector<int8_t> qB(k);
+    vector<half> sB(blocks);
+    quantB_q8_per32(B, qB, sB, k);
 
     // CPU 计算
     gemv(C_ref, A, B, m, n, k, alpha, beta);
@@ -425,9 +565,13 @@ int main()
     cl_command_queue queue = clCreateCommandQueueWithProperties(context, device, props, &err);
     checkErr(err, "clCreateCommandQueueWithProperties");
 
-    // Kernel test
-    KernelTest("gemv_q8_base", kernelSource, context, device, queue,
-               BlockA, B, C_gpu, C_ref, m, n, k, alpha, beta);
+    // Kernel test: AoS buffer
+    KernelTest("gemv_q8_base", context, device, queue,
+               BlockA, qB, sB, C_gpu, C_ref, m, n, k, alpha, beta);
+    // Kernel test: image2D weights (SoA)
+    std::fill(C_gpu.begin(), C_gpu.end(), half(0));
+    KernelTestImage("gemv_q8_soa_img", context, device, queue,
+                    Aq, Ad, qB, sB, C_gpu, C_ref, m, k, alpha, beta);
     // cleanup
     clReleaseCommandQueue(queue);
     clReleaseContext(context);
